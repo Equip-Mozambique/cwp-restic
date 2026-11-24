@@ -1,0 +1,909 @@
+#!/bin/bash
+# cwp-restic — restic backups for a CWP (Control Web Panel) server.
+#
+#   cwp-restic backup <repo>             back up to one repository
+#   cwp-restic prune                     apply the retention to every repository
+#   cwp-restic check                     verify every repository
+#   cwp-restic status                    list the snapshots in every repository
+#   cwp-restic refresh                   rewrite the status files without backing up
+#   cwp-restic apply                     check the settings and (re)create the systemd timers
+#   cwp-restic restic <repo> <args...>   run restic against a repository
+#   cwp-restic jobs | job <id>           run requests left by the admin page (systemd calls these)
+#
+# Settings live in /etc/cwp-restic; the README describes every file. They are
+# read as plain KEY=value text and are never run as shell.
+set -u
+umask 077
+
+CONF_DIR="${CWP_RESTIC_CONF_DIR:-/etc/cwp-restic}"
+STATE_DIR="${CWP_RESTIC_STATE_DIR:-/var/lib/cwp-restic}"
+LOG="${CWP_RESTIC_LOG:-/var/log/cwp-restic.log}"
+LOCK_DIR="${CWP_RESTIC_LOCK_DIR:-/run}"
+UNIT_DIR="${CWP_RESTIC_UNIT_DIR:-/etc/systemd/system}"
+RESTIC="${RESTIC:-/usr/local/bin/restic}"
+SYSTEMCTL="${SYSTEMCTL:-systemctl}"
+SELF="$(readlink -f "$0")"
+# systemd starts the jobs without HOME: restic needs a cache directory, and
+# pre.d scripts such as a MySQL dump look for /root/.my.cnf.
+export HOME="${HOME:-/root}"
+export RESTIC_CACHE_DIR="${CWP_RESTIC_CACHE_DIR:-/var/cache/cwp-restic}"
+
+# The settings the admin page may change. MAIL_CMD and CHECK_SUBSET can only be
+# set by editing the file on the server.
+CONFIG_KEYS="HOST_LABEL MAILTO WINDOW KEEP_DAILY KEEP_WEEKLY KEEP_MONTHLY PRUNE_AT CHECK_AT RESTORE_DIR RESTORE_KEEP_DAYS RESTORE_MIN_FREE_GB"
+REPO_KEYS="REPOSITORY SCHEDULE MOUNT LIMIT_UPLOAD_KB LATE_DAYS"
+
+NAME_RE='^[a-z][a-z0-9-]{0,30}$'
+JOB_RE='^[0-9]{8}-[0-9]{6}-[a-f0-9]{6}$'
+SNAPSHOT_RE='^[a-f0-9]{8,64}$'
+LABEL_RE='^[A-Za-z0-9._-]{1,64}$'
+MAIL_RE='^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+(,[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+)*$'
+TIME_RE='([01][0-9]|2[0-3]):[0-5][0-9](:[0-5][0-9])?'
+WINDOW_RE="^$TIME_RE-$TIME_RE\$"
+CALENDAR_RE='^[A-Za-z0-9 *:,./~-]+$'
+PATH_RE='^(/[A-Za-z0-9._-]+)+$'
+ADDRESS_RE='^[^[:space:][:cntrl:]-][^[:space:][:cntrl:]]*$'
+SUBSET_RE='^([0-9]{1,3}(\.[0-9]+)?%|[0-9]+[KMGT]|[0-9]+/[0-9]+)$'
+
+# ------------------------------------------------------------------ settings
+
+# conf <file> <KEY> [default] — the value of KEY in a settings file (the last
+# KEY=value line wins; one pair of surrounding quotes is dropped).
+conf() {
+    local line value=""
+    if [ -r "$1" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            [[ "$line" == "$2="* ]] && value="${line#*=}"
+        done <"$1"
+    fi
+    value="${value%"${value##*[![:space:]]}"}"
+    if [ ${#value} -ge 2 ] && [[ "$value" == \"*\" || "$value" == \'*\' ]]; then value="${value:1:${#value}-2}"; fi
+    printf '%s' "${value:-${3:-}}"
+}
+
+# conf_set <file> <KEY> <value> — change one line and leave the rest of the file alone.
+conf_set() {
+    local tmp="$1.tmp"
+    K="$2" V="$3" awk '
+        { line[NR] = $0; if (index($0, ENVIRON["K"] "=") == 1) last = NR }
+        END {
+            for (i = 1; i <= NR; i++) print (i == last ? ENVIRON["K"] "=" ENVIRON["V"] : line[i])
+            if (!last) print ENVIRON["K"] "=" ENVIRON["V"]
+        }' "$1" >"$tmp" && mv "$tmp" "$1"
+}
+
+default_for() {
+    case "$1" in
+        HOST_LABEL) hostname -s ;;
+        KEEP_DAILY) echo 7 ;;
+        KEEP_WEEKLY) echo 5 ;;
+        KEEP_MONTHLY) echo 12 ;;
+        RESTORE_DIR) echo /home/restic-restore ;;
+        RESTORE_KEEP_DAYS) echo 7 ;;
+        RESTORE_MIN_FREE_GB) echo 5 ;;
+        CHECK_SUBSET) echo "5%" ;;
+        MAIL_CMD) echo "/usr/sbin/sendmail -t" ;;
+        LATE_DAYS) echo 2 ;;
+    esac
+}
+
+hint() {
+    case "$1" in
+        HOST_LABEL) echo "letters, digits, dot, dash and underscore" ;;
+        MAILTO) echo "an email address, or several separated by commas" ;;
+        WINDOW) echo "HH:MM-HH:MM, or empty for any time" ;;
+        PRUNE_AT|CHECK_AT|SCHEDULE) echo "a systemd calendar time such as *-*-* 03:00:00, or empty" ;;
+        RESTORE_DIR|MOUNT) echo "a full path of letters, digits, dot, dash and underscore" ;;
+        REPOSITORY) echo "a restic repository address without spaces" ;;
+        CHECK_SUBSET) echo "such as 5% or 10G" ;;
+        MAIL_CMD) echo "a command on one line" ;;
+        *) echo "a whole number" ;;
+    esac
+}
+
+valid_calendar() {
+    [[ "$1" =~ $CALENDAR_RE ]] || return 1
+    if command -v systemd-analyze >/dev/null 2>&1; then systemd-analyze calendar -- "$1" >/dev/null 2>&1; fi
+}
+
+valid_path() { [[ "$1" =~ $PATH_RE ]] && [[ "/$1/" != */../* ]]; }
+
+# valid_value <KEY> <value>
+valid_value() {
+    local v="$2"
+    case "$1" in
+        HOST_LABEL) [[ "$v" =~ $LABEL_RE ]] ;;
+        MAILTO) [ -z "$v" ] || [[ "$v" =~ $MAIL_RE ]] ;;
+        WINDOW) [ -z "$v" ] || [[ "$v" =~ $WINDOW_RE ]] ;;
+        KEEP_DAILY|KEEP_WEEKLY|KEEP_MONTHLY|RESTORE_KEEP_DAYS|RESTORE_MIN_FREE_GB|LATE_DAYS) [[ "$v" =~ ^[0-9]{1,4}$ ]] ;;
+        LIMIT_UPLOAD_KB) [ -z "$v" ] || [[ "$v" =~ ^[0-9]{1,9}$ ]] ;;
+        PRUNE_AT|CHECK_AT|SCHEDULE) [ -z "$v" ] || valid_calendar "$v" ;;
+        RESTORE_DIR) valid_path "$v" ;;
+        MOUNT) [ -z "$v" ] || valid_path "$v" ;;
+        REPOSITORY) [[ "$v" =~ $ADDRESS_RE ]] ;;
+        CHECK_SUBSET) [[ "$v" =~ $SUBSET_RE ]] ;;
+        MAIL_CMD) [[ ! "$v" =~ [[:cntrl:]] ]] ;;
+        *) return 1 ;;
+    esac
+}
+
+# check_settings <dir> — print one line for each thing wrong with the settings
+# in that directory; false when there is any.
+check_settings() {
+    local dir="$1" key value name file line real=0 bad=0
+    for key in $CONFIG_KEYS CHECK_SUBSET MAIL_CMD; do
+        value="$(conf "$dir/config" "$key" "$(default_for "$key")")"
+        valid_value "$key" "$value" || { echo "$key: \"$value\" is not valid ($(hint "$key"))"; bad=1; }
+    done
+    if [ $bad = 0 ] && [ $(( $(conf "$dir/config" KEEP_DAILY 7) + $(conf "$dir/config" KEEP_WEEKLY 5) + $(conf "$dir/config" KEEP_MONTHLY 12) )) = 0 ]; then
+        echo "KEEP_DAILY, KEEP_WEEKLY and KEEP_MONTHLY are all 0: at least one must be higher"; bad=1
+    fi
+    for file in "$dir"/repos/*.conf; do
+        [ -e "$file" ] || continue
+        name="${file##*/}"; name="${name%.conf}"
+        if [[ ! "$name" =~ $NAME_RE ]]; then
+            echo "repository \"$name\": the name must be lowercase letters, digits and dashes, starting with a letter"; bad=1
+            continue
+        fi
+        for key in $REPO_KEYS; do
+            value="$(conf "$file" "$key" "$(default_for "$key")")"
+            valid_value "$key" "$value" || { echo "repository $name, $key: \"$value\" is not valid ($(hint "$key"))"; bad=1; }
+        done
+    done
+    if [ -r "$dir/include" ]; then
+        while IFS= read -r line || [ -n "$line" ]; do
+            line="${line%$'\r'}"
+            case "$line" in ''|'#'*) continue ;; esac
+            real=1
+            [[ "$line" == /* ]] || { echo "include list: \"$line\" must be a full path starting with /"; bad=1; }
+        done <"$dir/include"
+    fi
+    [ $real = 1 ] || { echo "include list: it is empty, so nothing would be backed up"; bad=1; }
+    return $bad
+}
+
+setting() { conf "$CONF_DIR/config" "$1" "$(default_for "$1")"; }
+repo_setting() { conf "$CONF_DIR/repos/$1.conf" "$2" "$(default_for "$2")"; }
+is_repo() { [[ "$1" =~ $NAME_RE ]] && [ -f "$CONF_DIR/repos/$1.conf" ]; }
+
+repo_names() {
+    local file name
+    for file in "$CONF_DIR"/repos/*.conf; do
+        [ -e "$file" ] || continue
+        name="${file##*/}"; name="${name%.conf}"
+        [[ "$name" =~ $NAME_RE ]] && echo "$name"
+    done
+}
+
+password_file() {
+    if [ -e "$CONF_DIR/repos/$1.password" ]; then echo "$CONF_DIR/repos/$1.password"; else echo "$CONF_DIR/password"; fi
+}
+
+# ------------------------------------------------------------------ log, mail, status files
+
+log() { printf '%s %s %s\n' "$(date -Is)" "$RUN" "$*" >>"$LOG"; }
+
+# skip <reason> — this run did nothing, and why.
+skip() { SKIPPED="$*"; log "$*"; }
+
+# send_mail <subject words> — mail the lines this run added to the log.
+send_mail() {
+    local cmd
+    [ -n "$MAILTO" ] && valid_value MAILTO "$MAILTO" || return 0
+    read -r -a cmd <<<"$MAIL_CMD"
+    {
+        echo "To: $MAILTO"
+        echo "Subject: [backup] $HOST_LABEL $1"
+        echo
+        tail -c +$((LOG_START + 1)) "$LOG" | tail -n 40
+    } | "${cmd[@]}" >/dev/null 2>&1
+}
+
+# notify FAILED|warning
+notify() {
+    if [ "$1" = FAILED ]; then OUTCOME=failed; else OUTCOME=warning; fi
+    send_mail "$RUN $1"
+}
+
+last_error() { tail -c +$((LOG_START + 1)) "$LOG" | sed -n 's/.* ERROR: //p' | tail -n 1; }
+
+# put_state <name> — save stdin as a status file, replacing it in one step so
+# the admin page never reads a half-written file. An empty or failed write
+# leaves the old file alone.
+put_state() {
+    local tmp="$STATE_DIR/.$1.tmp"
+    mkdir -p -m 700 "$STATE_DIR" 2>/dev/null || return 1
+    if cat >"$tmp" && [ -s "$tmp" ]; then mv "$tmp" "$STATE_DIR/$1"; else rm -f "$tmp"; return 1; fi
+}
+
+# save_state <repo> — snapshot list and stored size of a repository.
+save_state() {
+    r "$1" snapshots --json 2>>"$LOG" | put_state "snapshots-$1.json"
+    r "$1" stats --mode raw-data --json 2>>"$LOG" | put_state "stats-$1.json"
+}
+
+# record <name> — how this run ended (ok, warning, failed, stopped). A run that
+# did nothing leaves the last real result alone.
+record() {
+    [ -n "$OUTCOME" ] || return 0
+    printf '%s %s\n' "$(date -Is)" "$OUTCOME" | put_state "$1.last"
+}
+
+# require_settings — refuse to run on settings that make no sense.
+require_settings() {
+    local errors line
+    errors="$(check_settings "$CONF_DIR")" && return 0
+    while IFS= read -r line; do log "ERROR: $line"; done <<<"$errors"
+    echo "$errors" >&2
+    notify FAILED
+    return 1
+}
+
+size() { awk -v b="$1" 'BEGIN { if (b >= 1073741824) printf "%.1f GiB", b / 1073741824; else printf "%.1f MiB", b / 1048576 }'; }
+
+# ------------------------------------------------------------------ restic
+
+# Seconds since midnight for HH:MM or HH:MM:SS.
+tod() { local h m s; IFS=: read -r h m s <<<"$1"; echo $((10#$h * 3600 + 10#$m * 60 + 10#${s:-0})); }
+
+# window_left — seconds until the window closes; empty when there is no window,
+# 0 when we are outside it.
+window_left() {
+    [ -n "$WINDOW" ] || return 0
+    local start end now
+    start=$(tod "${WINDOW%-*}"); end=$(tod "${WINDOW#*-}"); now=$(tod "$(date +%H:%M:%S)")
+    if [ "$start" -le "$end" ]; then
+        if [ "$now" -ge "$start" ] && [ "$now" -lt "$end" ]; then echo $((end - now)); else echo 0; fi
+    elif [ "$now" -ge "$start" ]; then echo $((86400 - now + end))
+    elif [ "$now" -lt "$end" ]; then echo $((end - now))
+    else echo 0
+    fi
+}
+
+# in_window — false (with a log line) when a job may not start now.
+in_window() {
+    [ "$(window_left)" != 0 ] && return 0
+    skip "outside the backup window ($WINDOW), skipped"
+    return 1
+}
+
+window_closed() { [ "$1" = 124 ] || [ "$1" = 130 ]; }
+
+NICE=(nice -n 19)
+if command -v ionice >/dev/null 2>&1; then NICE+=(ionice -c3); fi
+
+# r <repo> <restic args...> — restic with the repository, password and any
+# extra back-end settings (repos/<repo>.env) of that repository. Scheduled work
+# is interrupted when the WINDOW closes (exit 124).
+r() {
+    local repo="$1" left="" line; shift
+    if [ "$USE_WINDOW" = 1 ]; then
+        left="$(window_left)"
+        [ "$left" = 0 ] && return 124
+    fi
+    (
+        if [ -r "$CONF_DIR/repos/$repo.env" ]; then
+            while IFS= read -r line || [ -n "$line" ]; do
+                line="${line%$'\r'}"
+                [[ "$line" =~ ^[A-Z_][A-Z0-9_]*= ]] && export "$line"
+            done <"$CONF_DIR/repos/$repo.env"
+        fi
+        RESTIC_REPOSITORY="$(repo_setting "$repo" REPOSITORY)"
+        RESTIC_PASSWORD_FILE="$(password_file "$repo")"
+        export RESTIC_REPOSITORY RESTIC_PASSWORD_FILE
+        exec ${left:+timeout --signal=INT --kill-after=120 "$left"} "${NICE[@]}" "$RESTIC" "$@"
+    )
+}
+
+# take_lock <repo> — returns 1 if another run holds it.
+take_lock() {
+    exec 9>"$LOCK_DIR/cwp-restic-$1.lock"
+    flock -n 9
+}
+
+# A repository with MOUNT set must sit on its own mounted disk, so a detached
+# volume cannot make the backup fill the root filesystem.
+mounted() {
+    local mount
+    mount="$(repo_setting "$1" MOUNT)"
+    [ -z "$mount" ] || mountpoint -q "$mount"
+}
+
+# Expand globs in the include file and drop paths that do not exist.
+build_file_list() {
+    local line path
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        case "$line" in ''|'#'*) continue ;; esac
+        while IFS= read -r path; do
+            [ -e "$path" ] && printf '%s\n' "$path"
+        done < <(compgen -G "$line")
+    done <"$CONF_DIR/include"
+}
+
+do_backup() {
+    local repo="$1" address rc pre_failed=0 files hook limit marker extra=()
+    address="$(repo_setting "$repo" REPOSITORY)"
+    in_window || return 0
+    if ! take_lock "$repo"; then skip "skipped, already running"; return 0; fi
+    log "start -> $address"
+
+    if ! mounted "$repo"; then
+        log "ERROR: $(repo_setting "$repo" MOUNT) is not mounted; refusing to write to $address"
+        notify FAILED; return 1
+    fi
+    if [ ! -s "$(password_file "$repo")" ]; then
+        log "ERROR: there is no repository password in $(password_file "$repo")"
+        notify FAILED; return 1
+    fi
+
+    for hook in "$CONF_DIR"/pre.d/*; do
+        [ -f "$hook" ] && [ -x "$hook" ] || continue
+        if ! CWP_RESTIC_REPO="$repo" "$hook" >>"$LOG" 2>&1; then
+            pre_failed=1
+            log "ERROR: pre.d/${hook##*/} failed; continuing with the backup"
+        fi
+    done
+
+    r "$repo" cat config >/dev/null 2>>"$LOG"; rc=$?
+    if [ $rc = 10 ]; then
+        # A repository that was there before and is now missing is an alarm,
+        # not a reason to start again from nothing.
+        marker="$STATE_DIR/initialized-$repo"
+        if [ "$(cat "$marker" 2>/dev/null)" = "$address" ]; then
+            log "ERROR: repository $address has disappeared; not creating a new one"
+            log "(bring it back, or remove $marker to start a new repository)"
+            notify FAILED; return 1
+        fi
+        log "repository does not exist, initializing"
+        r "$repo" init >>"$LOG" 2>&1; rc=$?
+    fi
+    if window_closed $rc; then log "backup window closed ($WINDOW) before the backup began"; OUTCOME=stopped; return 0; fi
+    if [ $rc != 0 ]; then
+        log "ERROR: cannot open repository (restic exit $rc)"
+        notify FAILED; return 1
+    fi
+    printf '%s\n' "$address" | put_state "initialized-$repo"
+    r "$repo" unlock >>"$LOG" 2>&1
+
+    files="$(mktemp)"
+    build_file_list >"$files"
+    [ -f "$CONF_DIR/exclude" ] && extra+=(--exclude-file "$CONF_DIR/exclude")
+    limit="$(repo_setting "$repo" LIMIT_UPLOAD_KB)"
+    [ -n "$limit" ] && extra+=(--limit-upload "$limit")
+    # Files restored from the admin page must not end up in the next backup.
+    r "$repo" backup --files-from-verbatim "$files" --exclude "$RESTORE_DIR" --exclude-caches \
+        --tag "$repo" --host "$HOST_LABEL" "${extra[@]}" >>"$LOG" 2>&1
+    rc=$?
+    rm -f "$files"
+
+    if window_closed $rc; then
+        log "backup window closed ($WINDOW); stopped, the next run continues from here"
+        OUTCOME=stopped; return 0
+    fi
+    if [ $rc != 0 ] && [ $rc != 3 ]; then
+        log "ERROR: backup failed (restic exit $rc)"
+        notify FAILED; return 1
+    fi
+    save_state "$repo"
+    if [ $pre_failed = 1 ]; then
+        log "snapshot saved, but a pre.d script failed"
+        notify FAILED; return 1
+    fi
+    if [ $rc = 3 ]; then
+        log "snapshot saved, some files could not be read"
+        notify warning; return 3
+    fi
+    log "done"
+    OUTCOME=ok; return 0
+}
+
+# for_each_repo <label> <restic args...> — run against every repository.
+for_each_repo() {
+    local label="$1" repo failed=0 ran=0 stopped=0 rc; shift
+    in_window || return 0
+    for repo in $(repo_names); do
+        if ! mounted "$repo"; then log "ERROR: $(repo_setting "$repo" MOUNT) is not mounted"; failed=1; continue; fi
+        if ! take_lock "$repo"; then log "skipped $repo, already running"; continue; fi
+        r "$repo" cat config >/dev/null 2>&1
+        if [ $? = 10 ]; then log "skipped $repo, no repository yet"; flock -u 9; continue; fi
+        log "$label $repo: $*"
+        r "$repo" "$@" >>"$LOG" 2>&1; rc=$?
+        if window_closed $rc; then log "backup window closed ($WINDOW); $label $repo stopped"; stopped=1
+        elif [ $rc != 0 ]; then log "ERROR: $label $repo failed (restic exit $rc)"; failed=1
+        else
+            ran=1
+            # Pruning changes the snapshot list and the stored size.
+            [ "$label" = prune ] && save_state "$repo"
+        fi
+        flock -u 9
+    done
+    if [ $failed = 1 ]; then notify FAILED; return 1; fi
+    if [ $stopped = 1 ]; then OUTCOME=stopped; elif [ $ran = 1 ]; then OUTCOME=ok; fi
+    return 0
+}
+
+do_prune() {
+    local keep=() n
+    n="$(setting KEEP_DAILY)"; [ "$n" -gt 0 ] && keep+=(--keep-daily "$n")
+    n="$(setting KEEP_WEEKLY)"; [ "$n" -gt 0 ] && keep+=(--keep-weekly "$n")
+    n="$(setting KEEP_MONTHLY)"; [ "$n" -gt 0 ] && keep+=(--keep-monthly "$n")
+    for_each_repo prune forget "${keep[@]}" --group-by host,tags --prune
+}
+
+# cleanup — remove what has expired: restored copies, finished requests and
+# cached folder listings. Only things this tool made are ever deleted.
+cleanup() {
+    local days dir name pid
+    days="$(setting RESTORE_KEEP_DAYS)"
+    if valid_path "$RESTORE_DIR" && [[ "$days" =~ ^[0-9]{1,4}$ ]] && [ "$days" -gt 0 ]; then
+        for dir in "$RESTORE_DIR"/*; do
+            name="${dir##*/}"
+            [[ "$name" =~ $JOB_RE ]] && [ -d "$dir" ] && [ ! -L "$dir" ] && [ -f "$dir/.cwp-restic-restore" ] || continue
+            [ -n "$(find "$dir/.cwp-restic-restore" -mmin +$((days * 1440)) 2>/dev/null)" ] || continue
+            log "removing the restored copy $dir (older than $days days)"
+            rm -rf --one-file-system -- "$dir"
+        done
+    fi
+    for dir in "$STATE_DIR"/jobs/*; do
+        name="${dir##*/}"
+        [[ "$name" =~ $JOB_RE ]] && [ -d "$dir" ] && [ ! -L "$dir" ] || continue
+        if [ -n "$(find "$dir" -maxdepth 0 -mmin +43200 2>/dev/null)" ]; then rm -rf -- "$dir"; continue; fi
+        # A request that says "running" but has no process was cut off, for example by a reboot.
+        if grep -q '^state=running$' "$dir/status" 2>/dev/null; then
+            pid="$(sed -n 's/^pid=//p' "$dir/status")"
+            if [[ "$pid" =~ ^[0-9]+$ ]] && ! kill -0 "$pid" 2>/dev/null; then
+                sed -i -e 's/^state=running$/state=failed/' -e 's/^message=.*/message=interrupted before it finished/' "$dir/status"
+            fi
+        fi
+    done
+    [ -d "$STATE_DIR/ls" ] && find "$STATE_DIR/ls" -mindepth 2 -maxdepth 2 -type d -mmin +10080 -exec rm -rf -- {} + 2>/dev/null
+    [ -d "$STATE_DIR/queue" ] && find "$STATE_DIR/queue" -maxdepth 1 -name '.*' -type f -mmin +1440 -delete 2>/dev/null
+    return 0
+}
+
+# ------------------------------------------------------------------ systemd timers
+
+# write_unit <file name> — stdin is the unit; remembers the ones that changed.
+write_unit() {
+    local tmp="$UNIT_DIR/.$1.tmp"
+    cat >"$tmp" || return 1
+    if cmp -s "$tmp" "$UNIT_DIR/$1"; then rm -f "$tmp"; return 0; fi
+    chmod 644 "$tmp" && mv "$tmp" "$UNIT_DIR/$1" && CHANGED+=("$1")
+}
+
+# timer <unit name> <what it does> <when> <cwp-restic arguments>
+timer() {
+    write_unit "$1.service" <<EOF
+[Unit]
+Description=cwp-restic: $2
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+SuccessExitStatus=3
+ExecStart=$SELF $4
+EOF
+    write_unit "$1.timer" <<EOF
+[Unit]
+Description=cwp-restic: $2
+
+[Timer]
+OnCalendar=$3
+
+[Install]
+WantedBy=timers.target
+EOF
+    WANTED+=("$1.timer")
+    echo "$1.timer: $3"
+}
+
+# apply — make the systemd timers match the settings.
+apply() {
+    local errors repo at file name failed=0
+    WANTED=(); CHANGED=()
+    if ! errors="$(check_settings "$CONF_DIR")"; then echo "$errors" >&2; return 1; fi
+    mkdir -p "$UNIT_DIR" || return 1
+    for repo in $(repo_names); do
+        at="$(repo_setting "$repo" SCHEDULE)"
+        [ -n "$at" ] && timer "cwp-restic-backup-$repo" "backup to $repo" "$at" "backup $repo"
+    done
+    at="$(setting PRUNE_AT)"; [ -n "$at" ] && timer cwp-restic-prune "remove old backups" "$at" prune
+    at="$(setting CHECK_AT)"; [ -n "$at" ] && timer cwp-restic-check "verify the repositories" "$at" check
+
+    # Requests from the admin page: a file appearing in the queue starts the
+    # dispatcher, which starts one unit per request so a long restore does not
+    # hold up the others.
+    write_unit cwp-restic-jobs.path <<EOF
+[Unit]
+Description=cwp-restic: requests from the CWP admin page
+
+[Path]
+PathExistsGlob=$STATE_DIR/queue/*.job
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    write_unit cwp-restic-jobs.service <<EOF
+[Unit]
+Description=cwp-restic: start requests from the CWP admin page
+
+[Service]
+Type=oneshot
+ExecStart=$SELF jobs
+EOF
+    write_unit cwp-restic-job@.service <<EOF
+[Unit]
+Description=cwp-restic: request %i from the CWP admin page
+
+[Service]
+Type=oneshot
+ExecStart=$SELF job %i
+EOF
+
+    for file in "$UNIT_DIR"/cwp-restic-*.timer; do
+        [ -e "$file" ] || continue
+        name="${file##*/}"
+        case " ${WANTED[*]} " in *" $name "*) continue ;; esac
+        "$SYSTEMCTL" disable --now "$name" >/dev/null 2>&1
+        rm -f "$file" "${file%.timer}.service"
+        echo "$name: removed"
+    done
+    mkdir -p -m 700 "$STATE_DIR/queue" "$STATE_DIR/jobs"
+    "$SYSTEMCTL" daemon-reload || failed=1
+    for name in "${WANTED[@]}"; do
+        "$SYSTEMCTL" enable --now "$name" >/dev/null 2>&1 || failed=1
+        # A timer that is already running keeps its old time until restarted.
+        case " ${CHANGED[*]} " in *" $name "*) "$SYSTEMCTL" restart "$name" >/dev/null 2>&1 || failed=1 ;; esac
+    done
+    "$SYSTEMCTL" enable --now cwp-restic-jobs.path >/dev/null 2>&1 || failed=1
+    if [ $failed = 1 ]; then echo "systemctl reported an error; check: systemctl list-timers 'cwp-restic-*'" >&2; return 1; fi
+    return 0
+}
+
+# ------------------------------------------------------------------ requests from the admin page
+#
+# The admin page never runs a command. It writes a small request file into
+# $STATE_DIR/queue; everything in a request is checked here before it is used.
+
+read_request() {
+    local line
+    REQ_KEYS=(); REQ_VALS=()
+    while IFS= read -r line || [ -n "$line" ]; do
+        line="${line%$'\r'}"
+        [[ "$line" == *=* ]] || continue
+        REQ_KEYS+=("${line%%=*}"); REQ_VALS+=("${line#*=}")
+    done <"$1"
+}
+
+# req <key> — the first value of that key in the request.
+req() {
+    local i
+    for i in "${!REQ_KEYS[@]}"; do
+        if [ "${REQ_KEYS[i]}" = "$1" ]; then printf '%s' "${REQ_VALS[i]}"; return 0; fi
+    done
+    return 1
+}
+
+write_status() {
+    {
+        echo "state=$J_STATE"
+        echo "action=$J_ACTION"
+        echo "repo=$J_REPO"
+        echo "message=$J_MESSAGE"
+        echo "target=$J_TARGET"
+        echo "started=$J_STARTED"
+        echo "finished=$J_FINISHED"
+        echo "pid=$$"
+    } >"$JOB_DIR/.status.tmp" && mv "$JOB_DIR/.status.tmp" "$JOB_DIR/status"
+}
+
+# job_end <done|failed|skipped> <message>
+job_end() {
+    J_STATE="$1"; J_MESSAGE="${2//[$'\r\n']/ }"; J_FINISHED="$(date +%s)"
+    write_status
+    log "$J_ACTION $1: $J_MESSAGE"
+}
+
+# Make a path match only itself when restic reads it as a pattern.
+escape_pattern() {
+    local s="$1"
+    s="${s//\\/\\\\}"; s="${s//\*/\\*}"; s="${s//\?/\\?}"; s="${s//\[/\\[}"; s="${s//\]/\\]}"
+    printf '%s' "$s"
+}
+
+job_backup() {
+    USE_WINDOW=1
+    do_backup "$J_REPO"
+    record "backup-$J_REPO"
+    tail -c +$((LOG_START + 1)) "$LOG" >"$JOB_DIR/output"
+    case "$OUTCOME" in
+        ok) job_end done "backup finished" ;;
+        warning) job_end done "backup finished, but some files could not be read (see the log)" ;;
+        failed) job_end failed "$(last_error)" ;;
+        stopped) job_end skipped "stopped: the backup window closed" ;;
+        *) job_end skipped "$SKIPPED" ;;
+    esac
+}
+
+# List one folder of a snapshot into the cache the admin page reads.
+job_ls() {
+    local snapshot path dir out
+    snapshot="$(req snapshot)"; path="$(req path)"
+    [[ "$snapshot" =~ $SNAPSHOT_RE ]] || { job_end failed "that is not a backup id"; return; }
+    [[ "$path" == /* ]] || { job_end failed "the folder must be a full path"; return; }
+    [ "$path" = / ] || path="${path%/}"
+    dir="$STATE_DIR/ls/$J_REPO/$snapshot"
+    mkdir -p "$dir" || { job_end failed "cannot write to $STATE_DIR"; return; }
+    out="$dir/$(printf '%s' "$path" | sha1sum | cut -c1-40).jsonl"
+    if ! r "$J_REPO" ls --json "$snapshot" "$path" >"$out.tmp" 2>"$JOB_DIR/output"; then
+        rm -f "$out.tmp"
+        job_end failed "restic could not list the folder: $(tail -n 1 "$JOB_DIR/output")"; return
+    fi
+    if ! grep -q '"struct_type":"node"' "$out.tmp"; then
+        rm -f "$out.tmp"
+        job_end failed "there is no such folder in this backup"; return
+    fi
+    mv "$out.tmp" "$out"
+    job_end done "listed $path"
+}
+
+# Copy chosen files out of a snapshot into a new folder under RESTORE_DIR.
+# Nothing that is live on the server is ever written to.
+job_restore() {
+    local snapshot target i path summary bytes files avail min rc count=0 whole=0 include=()
+    snapshot="$(req snapshot)"
+    [[ "$snapshot" =~ $SNAPSHOT_RE ]] || { job_end failed "that is not a backup id"; return; }
+    for i in "${!REQ_KEYS[@]}"; do
+        [ "${REQ_KEYS[i]}" = path ] || continue
+        path="${REQ_VALS[i]}"
+        [[ "$path" == /* ]] || { job_end failed "every file or folder must be a full path"; return; }
+        count=$((count + 1))
+        if [ "$path" = / ]; then whole=1; else include+=(--include "$(escape_pattern "${path%/}")"); fi
+    done
+    [ $count -gt 0 ] || { job_end failed "nothing was chosen to restore"; return; }
+    [ $count -le 500 ] || { job_end failed "too many items chosen at once (the limit is 500); choose their folder instead"; return; }
+    [ $whole = 1 ] && include=()
+    target="$RESTORE_DIR/$JOB_ID"
+    [ ! -e "$target" ] || { job_end failed "$target already exists"; return; }
+    log "restore from $J_REPO backup $snapshot, $count item(s) -> $target"
+
+    # A trial run tells how much would be copied, before anything is written.
+    summary="$(r "$J_REPO" restore "$snapshot" --dry-run --json --target "$target" "${include[@]}" 2>>"$JOB_DIR/output" \
+        | grep '"message_type":"summary"' | tail -n 1)"
+    bytes="$(sed -n 's/.*"total_bytes":\([0-9]*\).*/\1/p' <<<"$summary")"
+    files="$(sed -n 's/.*"total_files":\([0-9]*\).*/\1/p' <<<"$summary")"
+    if [ -z "$bytes" ] || [ -z "$files" ]; then
+        log "ERROR: restic could not read the backup"
+        job_end failed "restic could not read the backup: $(tail -n 1 "$JOB_DIR/output")"; return
+    fi
+    [ "$files" != 0 ] || { job_end failed "nothing in this backup matches what was chosen"; return; }
+
+    mkdir -p "$RESTORE_DIR" || { job_end failed "cannot create $RESTORE_DIR"; return; }
+    avail="$(df --output=avail -B1 "$RESTORE_DIR" | tail -n 1 | tr -d ' ')"
+    min="$(setting RESTORE_MIN_FREE_GB)"
+    if [[ ! "$avail" =~ ^[0-9]+$ ]] || [ "$avail" -lt $((bytes + min * 1073741824)) ]; then
+        log "ERROR: not enough free space for the restore"
+        job_end failed "not enough free space in $RESTORE_DIR: the files need $(size "$bytes"), $(size "${avail:-0}") is free and $min GiB must stay free"; return
+    fi
+
+    mkdir -m 700 "$target" || { job_end failed "cannot create $target"; return; }
+    printf 'repository=%s\nsnapshot=%s\n' "$J_REPO" "$snapshot" >"$target/.cwp-restic-restore"
+    J_TARGET="$target"; J_MESSAGE="copying $files items, $(size "$bytes")"
+    write_status
+    RESTIC_PROGRESS_FPS=0.5 r "$J_REPO" restore "$snapshot" --json --target "$target" "${include[@]}" >>"$JOB_DIR/output" 2>&1; rc=$?
+    # The folder is removed RESTORE_KEEP_DAYS after the restore ended.
+    touch "$target/.cwp-restic-restore"
+    if [ $rc != 0 ]; then
+        log "ERROR: restore failed (restic exit $rc); what was copied so far is in $target"
+        send_mail "restore FAILED"
+        job_end failed "the restore failed (restic exit $rc); what was copied so far is in $target"; return
+    fi
+    log "restore finished: $files items, $(size "$bytes") in $target"
+    send_mail "restore finished"
+    job_end done "$files items, $(size "$bytes") restored"
+}
+
+# put_conf <new file> <settings file> — install with the right permissions, in one step.
+put_conf() {
+    local tmp="${2%/*}/.new-${2##*/}"
+    cp "$1" "$tmp" && chmod 600 "$tmp" && mv "$tmp" "$2"
+}
+
+# Change the settings. The request is applied to a copy first; one wrong value
+# and nothing changes. The previous settings are kept in $CONF_DIR/.previous.
+job_settings() {
+    local stage="$STATE_DIR/staged-$JOB_ID" i key value name rest file errors="" out
+    local set_include=0 set_exclude=0 includes=() excludes=() deleted=()
+    rm -rf "$stage"
+    mkdir -p "$stage/repos" || { job_end failed "cannot write to $STATE_DIR"; return; }
+    for file in config include exclude; do
+        [ -f "$CONF_DIR/$file" ] && cp "$CONF_DIR/$file" "$stage/$file"
+    done
+    for name in $(repo_names); do cp "$CONF_DIR/repos/$name.conf" "$stage/repos/"; done
+    touch "$stage/config"
+
+    for i in "${!REQ_KEYS[@]}"; do
+        key="${REQ_KEYS[i]}"; value="${REQ_VALS[i]}"
+        case "$key" in
+            action) ;;
+            include.set) set_include=1 ;;
+            exclude.set) set_exclude=1 ;;
+            include) includes+=("$value") ;;
+            exclude) excludes+=("$value") ;;
+            config.*)
+                name="${key#config.}"
+                case " $CONFIG_KEYS " in
+                    *" $name "*) conf_set "$stage/config" "$name" "$value" ;;
+                    *) errors+="$name cannot be changed from the admin page"$'\n' ;;
+                esac ;;
+            repo.*.*)
+                rest="${key#repo.}"; name="${rest%.*}"; rest="${rest##*.}"
+                if [[ ! "$name" =~ $NAME_RE ]]; then
+                    errors+="repository \"$name\": the name must be lowercase letters, digits and dashes, starting with a letter"$'\n'
+                elif [ "$rest" = delete ]; then
+                    deleted+=("$name"); rm -f "$stage/repos/$name.conf"
+                else
+                    case " $REPO_KEYS " in
+                        *" $rest "*) touch "$stage/repos/$name.conf"; conf_set "$stage/repos/$name.conf" "$rest" "$value" ;;
+                        *) errors+="repository $name: $rest cannot be changed from the admin page"$'\n' ;;
+                    esac
+                fi ;;
+            *) errors+="unknown setting \"$key\""$'\n' ;;
+        esac
+    done
+    [ $set_include = 1 ] && printf '%s\n' "${includes[@]}" | sed '/^$/d' >"$stage/include"
+    [ $set_exclude = 1 ] && printf '%s\n' "${excludes[@]}" | sed '/^$/d' >"$stage/exclude"
+    for file in "$stage"/include "$stage"/exclude; do
+        if [ -f "$file" ] && grep -q '[[:cntrl:]]' "$file"; then errors+="the ${file##*/} list has characters that cannot be used"$'\n'; fi
+    done
+    errors+="$(check_settings "$stage")"
+    errors="${errors%$'\n'}"
+    if [ -n "$errors" ]; then
+        rm -rf "$stage"
+        job_end failed "nothing was changed: ${errors//$'\n'/; }"; return
+    fi
+
+    rm -rf "$CONF_DIR/.previous"
+    mkdir -p "$CONF_DIR/.previous/repos" "$CONF_DIR/repos"
+    for file in config include exclude; do
+        [ -f "$CONF_DIR/$file" ] && cp -p "$CONF_DIR/$file" "$CONF_DIR/.previous/$file"
+        [ -f "$stage/$file" ] && put_conf "$stage/$file" "$CONF_DIR/$file"
+    done
+    for name in $(repo_names); do cp -p "$CONF_DIR/repos/$name.conf" "$CONF_DIR/.previous/repos/"; done
+    for file in "$stage"/repos/*.conf; do
+        [ -e "$file" ] && put_conf "$file" "$CONF_DIR/repos/${file##*/}"
+    done
+    # Only the settings file goes. The repository and its backups are not touched.
+    for name in "${deleted[@]}"; do rm -f "$CONF_DIR/repos/$name.conf"; done
+    rm -rf "$stage"
+    log "settings changed from the admin page (the previous ones are in $CONF_DIR/.previous)"
+    if ! out="$(apply 2>&1)"; then
+        log "ERROR: settings saved, but the timers could not be updated: ${out//$'\n'/; }"
+        job_end failed "the settings were saved, but the timers could not be updated: ${out//$'\n'/; }"; return
+    fi
+    printf '%s\n' "$out" >"$JOB_DIR/output"
+    job_end done "settings saved"
+}
+
+# run_job <id> — carry out one request.
+run_job() {
+    local errors
+    JOB_ID="$1"; JOB_DIR="$STATE_DIR/jobs/$JOB_ID"
+    [[ "$JOB_ID" =~ $JOB_RE ]] && [ -f "$JOB_DIR/request" ] || { echo "no such request: $JOB_ID" >&2; return 1; }
+    grep -q '^state=queued$' "$JOB_DIR/status" 2>/dev/null || { echo "request $JOB_ID was already carried out" >&2; return 1; }
+    read_request "$JOB_DIR/request"
+    J_ACTION="$(req action)"; J_REPO="$(req repo)"
+    J_STATE=running; J_MESSAGE=""; J_TARGET=""; J_STARTED="$(date +%s)"; J_FINISHED=""
+    case "$J_ACTION" in backup|ls|restore|settings) ;; *) J_ACTION=unknown ;; esac
+    [[ "$J_REPO" =~ $NAME_RE ]] || J_REPO=""
+    write_status
+    : >"$JOB_DIR/output"
+    if [ "$J_ACTION" = unknown ]; then job_end failed "unknown request"; return 0; fi
+    if [ "$J_ACTION" != settings ]; then
+        is_repo "$J_REPO" || { job_end failed "unknown repository"; return 0; }
+        if ! errors="$(check_settings "$CONF_DIR")"; then
+            job_end failed "the settings are not valid: ${errors//$'\n'/; }"; return 0
+        fi
+    fi
+    "job_$J_ACTION"
+    return 0
+}
+
+# run_queue — move every waiting request out of the queue and start it.
+run_queue() {
+    local file base id
+    mkdir -p -m 700 "$STATE_DIR/queue" "$STATE_DIR/jobs" || return 1
+    for file in "$STATE_DIR"/queue/*; do
+        [ -e "$file" ] || [ -L "$file" ] || continue
+        base="${file##*/}"; id="${base%.job}"
+        if [ -L "$file" ] || [ ! -f "$file" ] || [ "$base" = "$id" ] || [[ ! "$id" =~ $JOB_RE ]] \
+            || [ -e "$STATE_DIR/jobs/$id" ] || [ "$(stat -c %s "$file")" -gt 1048576 ]; then
+            log "threw away a request file that is not valid"
+            rm -rf -- "$file"; continue
+        fi
+        if ! { mkdir "$STATE_DIR/jobs/$id" && mv -- "$file" "$STATE_DIR/jobs/$id/request"; }; then rm -rf -- "$file"; continue; fi
+        echo "state=queued" >"$STATE_DIR/jobs/$id/status"
+        if [ "${CWP_RESTIC_INLINE_JOBS:-}" = 1 ]; then
+            "$SELF" job "$id"
+        elif ! "$SYSTEMCTL" start --no-block "cwp-restic-job@$id.service"; then
+            printf 'state=failed\nmessage=systemd could not start the request\n' >"$STATE_DIR/jobs/$id/status"
+        fi
+    done
+    cleanup
+}
+
+# ------------------------------------------------------------------ main
+
+CMD="${1:-}"
+case "$CMD" in
+    backup|prune|check|status|refresh|apply|restic|jobs|job) ;;
+    *) sed -n '2,14p' "$0"; exit 1 ;;
+esac
+[ -r "$CONF_DIR/config" ] || { echo "cannot read $CONF_DIR/config" >&2; exit 1; }
+
+RUN="$CMD"
+LOG_START=$(stat -c %s "$LOG" 2>/dev/null || echo 0)
+# How this run ended: ok, warning, failed or stopped. Empty = it did nothing
+# (outside the window, already running), and SKIPPED says why.
+OUTCOME=""
+SKIPPED=""
+# Only scheduled work keeps to the WINDOW; browsing and restoring do not.
+USE_WINDOW=0
+HOST_LABEL="$(setting HOST_LABEL)"
+MAILTO="$(setting MAILTO)"
+MAIL_CMD="$(setting MAIL_CMD)"
+WINDOW="$(setting WINDOW)"
+RESTORE_DIR="$(setting RESTORE_DIR)"
+
+case "$CMD" in
+    backup)
+        repo="${2:-}"
+        is_repo "$repo" || { echo "unknown repository \"$repo\": there is no $CONF_DIR/repos/$repo.conf" >&2; exit 1; }
+        RUN="backup $repo"; USE_WINDOW=1
+        if require_settings; then do_backup "$repo"; rc=$?; else rc=1; fi
+        record "backup-$repo"
+        cleanup
+        exit $rc ;;
+    prune)
+        USE_WINDOW=1
+        if require_settings; then do_prune; rc=$?; else rc=1; fi
+        record prune
+        exit $rc ;;
+    check)
+        USE_WINDOW=1
+        # Part of the data is read back each time; restic picks a different part each run.
+        if require_settings; then for_each_repo check check "--read-data-subset=$(setting CHECK_SUBSET)"; rc=$?; else rc=1; fi
+        record check
+        exit $rc ;;
+    status)
+        for repo in $(repo_names); do
+            echo "== $repo: $(repo_setting "$repo" REPOSITORY)"
+            r "$repo" snapshots --compact
+        done ;;
+    refresh)
+        USE_WINDOW=1
+        require_settings || exit 1
+        if in_window; then
+            for repo in $(repo_names); do
+                mounted "$repo" || continue
+                r "$repo" cat config >/dev/null 2>&1
+                if [ $? = 10 ]; then log "skipped $repo, no repository yet"; continue; fi
+                save_state "$repo"
+            done
+        fi ;;
+    apply)
+        apply ;;
+    restic)
+        repo="${2:-}"
+        is_repo "$repo" || { echo "usage: cwp-restic restic <repo> <args...>   (repositories: $(repo_names | tr '\n' ' '))" >&2; exit 1; }
+        shift 2
+        r "$repo" "$@" ;;
+    jobs)
+        run_queue ;;
+    job)
+        RUN="job ${2:-}"
+        run_job "${2:-}" ;;
+esac

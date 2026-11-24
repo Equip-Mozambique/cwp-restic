@@ -1,0 +1,40 @@
+# /etc/cwp-restic/config — general settings for cwp-restic.
+#
+# Plain KEY=value lines. The file is read as text and never run; a line that
+# does not start with KEY= is ignored. Most settings can also be changed on the
+# admin page (Restic Backups, Settings). After editing by hand: cwp-restic apply
+
+# The name of this server in the backups and in mail. Default: the short host name.
+#HOST_LABEL=web1
+
+# Who is told about failed backups and finished restores. Several addresses are
+# separated by commas. Empty = no mail.
+MAILTO=
+
+# Scheduled work and "Back up now" only run between these hours (server time),
+# and a backup still running when the window closes stops and continues the
+# next night. Empty = any time.
+#WINDOW=19:00-08:00
+
+# How many backups are kept when old ones are removed.
+KEEP_DAILY=7
+KEEP_WEEKLY=5
+KEEP_MONTHLY=12
+
+# When old backups are removed, and when the repositories are verified
+# (systemd calendar times). Empty = never.
+PRUNE_AT=Sat *-*-* 06:00:00
+CHECK_AT=*-*-01 07:00:00
+
+# Restores from the admin page are copied to a new folder under RESTORE_DIR,
+# which is removed again RESTORE_KEEP_DAYS later (0 = never). A restore is
+# refused when it would leave less than RESTORE_MIN_FREE_GB free.
+#RESTORE_DIR=/home/restic-restore
+#RESTORE_KEEP_DAYS=7
+#RESTORE_MIN_FREE_GB=5
+
+# These two can only be set here, not on the admin page.
+# How much of the stored data each verification reads back.
+#CHECK_SUBSET=5%
+# The command that mail is piped to.
+#MAIL_CMD=/usr/sbin/sendmail -t

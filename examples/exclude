@@ -1,0 +1,24 @@
+# /etc/cwp-restic/exclude — what is left out, as restic exclude patterns.
+# Folders marked with a CACHEDIR.TAG file and the RESTORE_DIR folder are always
+# left out.
+# CWP's own backups and their work folder:
+/home/backup
+/home/tmp_bak
+# Per-account scratch, statistics and caches:
+/home/*/tmp
+/home/*/cwp_stats
+/home/*/.cache
+/home/*/.npm
+/home/*/.composer/cache
+/root/.cache
+/root/.npm
+# Caches and logs that sites rebuild by themselves:
+/home/**/wp-content/cache
+/home/**/wp-content/wflogs
+/home/**/storage/framework/cache
+/home/**/storage/framework/sessions
+/home/**/storage/framework/views
+/home/**/runtime/cache
+/home/**/error_log
+/home/**/debug.log
+core.[0-9]*

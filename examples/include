@@ -1,0 +1,16 @@
+# /etc/cwp-restic/include — what is backed up. One full path per line; * and ?
+# work, and a path that does not exist on this server is skipped.
+# Accounts, mail and the system settings of a CWP server:
+/home
+/var/vmail
+/etc
+/root
+/usr/local/apache/conf
+/usr/local/apache/conf.d
+/usr/local/cwp/.conf
+/usr/local/cwpsrv/conf
+/opt/alt/php-fpm*/usr/etc
+/var/named
+/var/spool/cron
+# Database dumps written by the pre.d scripts:
+/var/backups/cwp-restic
